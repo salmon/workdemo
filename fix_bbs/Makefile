@@ -1,5 +1,5 @@
 CC ?= gcc
-FIX_SECTOR_SOURCE := fix_sector.c
+FIX_SECTOR_SOURCE := fix_sector.c sgio.c
 CFLAGS := -Wall -g
 FIX_SECTOR_OBJS = $(FIX_SECTOR_SOURCE:.c=.o)
 

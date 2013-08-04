@@ -1,38 +1,18 @@
-#define _GNU_SOURCE
-#define _LARGEFILE64_SOURCE
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
-
-#include <linux/types.h>
-#include <linux/fs.h>
-#include <sys/ioctl.h>
-#include <errno.h>
-#include <inttypes.h>
-#include <sys/time.h>
-
-#include <syslog.h>
-#include <signal.h>
-
+#include "fix_sector.h"
 #include "md_u.h"
 #include "md_p.h"
 
+#define PROC_NAME "fix_sector"
 #define BUF_SIZE (1024 * 1024)
 #define RETRY 3
 #define SECTOR_SIZE 512
-#define MD_SB_BYTES 4096
-#define MD_SB_MAGIC 0xa92b4efc
 #define INTERVAL 2
-#define PROC_NAME "fix_sector"
+#define HD_SERIAL_LEN 21
+#define ETC_PATHNAME "/etc/fix_sector/"
 
 struct device_info {
 	char *name;
+	char serialno[HD_SERIAL_LEN];
 
 	__u64 total_sectors;
 	__u32 sector_size;
@@ -54,7 +34,7 @@ char *buf;
 
 static void usage()
 {
-	printf("Version: v0.1\n");
+	printf("Version: v0.2\n");
 	printf("Usage:\n");
 	printf("\t-f [dev_name] [start_offset]: fix disk bad sector\n");
 	printf("\t-s [dev_name]: query disk current status\n");
@@ -121,7 +101,17 @@ int load_super1(int fd)
 	return -1;
 }
 
-static int get_raidinfo(int fd)
+static char *strip(char *s)
+{
+	char *e;
+
+	while (*s == ' ') ++s;
+	if (*s)
+		for (e = s + strlen(s); *--e == ' '; *e = '\0');
+	return s;
+}
+
+static int get_rdevinfo(int fd)
 {
 	int ret;
 
@@ -135,6 +125,8 @@ static int get_raidinfo(int fd)
 static int get_devinfo(int fd)
 {
 	struct stat stat_buf;
+	__u16 id[256];
+	int ident = 1;
 
 	memset(&stat_buf, 0, sizeof(stat_buf));
 	if (fstat(fd, &stat_buf) < 0 ) {
@@ -157,22 +149,108 @@ static int get_devinfo(int fd)
 		return -1;
 	}
 
-	dinfo.phy_sector_size = 512;
+	/* get SerialNo, consider as unique */
+	memset(id, 0, sizeof(id));
+	if (get_identify_data(fd, id)) {
+		ident = 0;
+		memset(id, 0, sizeof(id));
+		if (ioctl(fd, HDIO_GET_IDENTITY, id))
+			return -1;
+	}
+	memset(dinfo.serialno, 0, sizeof(dinfo.serialno));
+	memcpy(dinfo.serialno, (char *)&id[10], 20);
+	strip(dinfo.serialno);
 
-	return get_raidinfo(fd);
+	if (ident) {
+		if((id[106] & 0xc000) != 0x4000) {
+			dinfo.phy_sector_size = 512;
+		} else {
+			unsigned int lsize = 256, pfactor = 1;
+			if (id[106] & (1<<13))
+				pfactor = (1 << (id[106] & 0xf));
+			if (id[106] & (1<<12))
+				lsize = (id[118] << 16) | id[117];
+			dinfo.phy_sector_size = 2 * lsize * pfactor;
+			if ((id[209] & 0xc000) == 0x4000) {
+				unsigned int offset = id[209] & 0x1fff;
+				if (0 != offset * 2 * lsize)
+					dinfo.phy_sector_size = 512;
+			}
+		}
+	} else
+		dinfo.phy_sector_size = 512;
+
+	return get_rdevinfo(fd);
+}
+
+static int check_array_status()
+{
+	char cmd[128], buf[512];
+	FILE *fp;
+
+	sprintf(cmd, "mdadm -Ds > /dev/shm/fix_array_info");
+	fp = popen(cmd, "r");
+	if (fp != NULL) {
+		memset(buf, 0, sizeof(buf));
+		fgets(buf, sizeof(buf), fp);
+	}
+
+	return 0;
 }
 
 /**********/
 
+static int open_etc_file(int create)
+{
+	char filename[128];
+	int fd, ret;
+
+	if (access(ETC_PATHNAME, F_OK)) {
+		ret = mkdir(ETC_PATHNAME, 0755);
+		if (ret)
+			return -1;
+	}
+
+	sprintf(filename, ETC_PATHNAME"fix_%s_%x_%x_%x_%x_%d", dinfo.serialno, dinfo.raid_uuid[0],
+			dinfo.raid_uuid[1], dinfo.raid_uuid[2], dinfo.raid_uuid[3], dinfo.role);
+
+	if (create) {
+		fd = open(filename, O_RDWR | O_SYNC | O_CREAT | O_TRUNC);
+		if (fd < 0) {
+			perror("create etcfile error");
+			return -1;
+		}
+	} else {
+		fd = open(filename, O_RDONLY);
+		if (fd < 0) {
+			if (errno == ENOENT)
+				return -2;
+			else
+				return -1;
+		}
+	}
+
+	return fd;
+}
+
+static int unlink_etc_file()
+{
+	char filename[128];
+
+	sprintf(filename, ETC_PATHNAME"fix_%s_%x_%x_%x_%x_%d", dinfo.serialno, dinfo.raid_uuid[0],
+			dinfo.raid_uuid[1], dinfo.raid_uuid[2], dinfo.raid_uuid[3], dinfo.role);
+
+	unlink(filename);
+
+	return 0;
+}
+
 static int open_shm_file(int create)
 {
 	char filename[128];
-	char devname[16];
 	int fd;
 
-	memset(devname, 0, sizeof(devname));
-	sscanf(dinfo.name, "/dev/%s", devname);
-	sprintf(filename, "/dev/shm/fix_%s_%x_%x_%x_%x_%d", devname, dinfo.raid_uuid[0],
+	sprintf(filename, "/dev/shm/fix_%s_%x_%x_%x_%x_%d", dinfo.serialno, dinfo.raid_uuid[0],
 			dinfo.raid_uuid[1], dinfo.raid_uuid[2], dinfo.raid_uuid[3], dinfo.role);
 
 	if (create) {
@@ -182,7 +260,7 @@ static int open_shm_file(int create)
 			return -1;
 		}
 	} else {
-		fd = open(filename, O_RDWR | O_SYNC);
+		fd = open(filename, O_RDONLY);
 		if (fd < 0) {
 			if (errno == ENOENT)
 				return -2;
@@ -197,11 +275,8 @@ static int open_shm_file(int create)
 static int clear_status()
 {
 	char filename[128];
-	char devname[16];
 
-	memset(devname, 0, sizeof(devname));
-	sscanf(dinfo.name, "/dev/%s", devname);
-	sprintf(filename, "/dev/shm/fix_%s_%x_%x_%x_%x_%d", devname, dinfo.raid_uuid[0],
+	sprintf(filename, "/dev/shm/fix_%s_%x_%x_%x_%x_%d", dinfo.serialno, dinfo.raid_uuid[0],
 			dinfo.raid_uuid[1], dinfo.raid_uuid[2], dinfo.raid_uuid[3], dinfo.role);
 
 	unlink(filename);
@@ -226,14 +301,49 @@ static int write_status(int fd, off64_t offset, int status)
 	return 0;
 }
 
+static int check()
+{
+	char cmd[64];
+	char buf[128];
+	int count = 0;
+	FILE *fp;
+
+	sprintf(cmd, "ps -ef|grep \"%s -f %s \"| grep -v grep | wc -l", PROC_NAME, dinfo.name);
+	fp = popen(cmd, "r");
+	if (fp != NULL) {
+		memset(buf, 0, sizeof(buf));
+		fgets(buf, sizeof(buf), fp);
+		count = atoi(buf);
+	}
+
+	if (count > 1) {
+		printf("more than one is running\n");
+		return -1;
+	} else
+		return 0;
+}
+
 static int print_status()
 {
-	int shm_fd, ret;
+	int shm_fd, etc_fd = -1, ret;
 	char shm_buf[512];
 	time_t start_time, cur_time, finish_time = 3600 * 2;
 	off64_t start_offset, offset;
 	int status, percent = 0;
 	double avg_spd, remained;
+
+	etc_fd = open_etc_file(0);
+	if (-1 == check() && -2 == etc_fd) {
+		printf("%s is not fixing\n", dinfo.name);
+		return 0;
+	} else if (etc_fd > 0) {
+		ret = sscanf(shm_buf, "%d-%lu-%lu-%"PRId64"-%"PRId64"\n", &status, &cur_time,
+			&start_time, &start_offset, &offset);
+		if (status == 1) {
+			printf("fix badsector finished successfull\n");
+			return 0;
+		}
+	}
 
 	shm_fd = open_shm_file(0);
 	if (shm_fd < 0) {
@@ -360,7 +470,7 @@ static int fix_bad_sector(int fd, off64_t start_offset)
 	off64_t offset;
 	__u64 scaned_size = 0;
 	ssize_t size;
-	int ret, shm_fd, last = 0;
+	int ret, shm_fd, etc_fd, last = 0;
 	struct timeval ctime;
 	time_t last_sec;
 
@@ -373,6 +483,7 @@ static int fix_bad_sector(int fd, off64_t start_offset)
 
 	openlog("fix_bad_sector", LOG_CONS | LOG_PID, LOG_USER);
 
+	unlink_etc_file();
 	shm_fd = open_shm_file(1);
 	if (shm_fd < 0)
 		return 1;
@@ -434,6 +545,13 @@ static int fix_bad_sector(int fd, off64_t start_offset)
 
 	offset = start_offset + scaned_size;
 	write_status(shm_fd, offset, 1);
+
+	etc_fd = open_etc_file(1);
+	if (etc_fd < 0)
+		return 1;
+	write_status(etc_fd, offset, 1);
+
+	close(etc_fd);
 	close(shm_fd);
 	closelog();
 
@@ -468,28 +586,6 @@ static int open_ro(const char *devname)
 
 /**************************************/
 
-static int check()
-{
-	char cmd[64];
-	char buf[128];
-	int count = 0;
-	FILE *fp;
-
-	sprintf(cmd, "ps -ef|grep \"%s -f %s \"| grep -v grep | wc -l", PROC_NAME, dinfo.name);
-	fp = popen(cmd, "r");
-	if (fp != NULL) {
-		memset(buf, 0, sizeof(buf));
-		fgets(buf, sizeof(buf), fp);
-		count = atoi(buf);
-	}
-
-	if (count > 1) {
-		printf("more than one is running\n");
-		return -1;
-	} else
-		return 0;
-}
-
 static int stop_fixing()
 {
 	char cmd[64];
@@ -504,6 +600,8 @@ static int stop_fixing()
 		memset(buf, 0, sizeof(buf));
 		fgets(buf, sizeof(buf), fp);
 		kpid = atoi(buf);
+		if (0 == kpid)
+			return 0;
 	}
 
 	kill(kpid, SIGINT);
@@ -616,6 +714,11 @@ int main(int argc, char **argv)
 		ret = check(argv[0]);
 		if (ret)
 			return 0;
+
+		ret = check_array_status();
+		if (ret)
+			return 0;
+
 		ret = deamon_init();
 		if (ret)
 			return 0;
