@@ -16,6 +16,7 @@
 #define _MD_U_H
 
 /* ioctls */
+#define MD_MAJOR 9
 
 /* status */
 #define RAID_VERSION		_IOR (MD_MAJOR, 0x10, mdu_version_t)

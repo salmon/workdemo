@@ -9,6 +9,7 @@
 #define INTERVAL 2
 #define HD_SERIAL_LEN 21
 #define ETC_PATHNAME "/etc/fix_sector/"
+#define ARRAY_PATHNAME "/dev/shm/fix_array_info"
 
 struct device_info {
 	char *name;
@@ -126,6 +127,7 @@ static int get_devinfo(int fd)
 {
 	struct stat stat_buf;
 	__u16 id[256];
+	char *p;
 	int ident = 1;
 
 	memset(&stat_buf, 0, sizeof(stat_buf));
@@ -159,7 +161,12 @@ static int get_devinfo(int fd)
 	}
 	memset(dinfo.serialno, 0, sizeof(dinfo.serialno));
 	memcpy(dinfo.serialno, (char *)&id[10], 20);
-	strip(dinfo.serialno);
+	p = strip(dinfo.serialno);
+	if (strlen(p)) {
+		strncpy(dinfo.serialno, p, 10);
+	} else {
+		perror("get serial number error");
+	}
 
 	if (ident) {
 		if((id[106] & 0xc000) != 0x4000) {
@@ -180,19 +187,74 @@ static int get_devinfo(int fd)
 	} else
 		dinfo.phy_sector_size = 512;
 
+	//fprintf(stderr, "phy sector size %d\n", dinfo.phy_sector_size);
+
 	return get_rdevinfo(fd);
+}
+
+static int get_array_info(const char *array_name, mdu_array_info_t *array)
+{
+	int fd;
+
+	fd = open(array_name, O_RDONLY);
+	if (fd < 0)
+		return -1;
+
+	if (ioctl(fd, GET_ARRAY_INFO, array) < 0) {
+		close(fd);
+		return -1;
+	}
+
+/*
+	printf("%d\n", array.raid_disks);
+	printf("%d\n", array.active_disks);
+	printf("%d\n", array.working_disks);
+	printf("%d\n", array.failed_disks);
+	printf("%d\n", array.spare_disks);
+	printf("%x\n", array.state);
+*/
+
+	close(fd);
+
+	return 0;
 }
 
 static int check_array_status()
 {
-	char cmd[128], buf[512];
+	char cmd[128], buf[512], devname[16];
+	int uuid[4], ret, found = 0;
 	FILE *fp;
+	mdu_array_info_t array;
 
-	sprintf(cmd, "mdadm -Ds > /dev/shm/fix_array_info");
-	fp = popen(cmd, "r");
-	if (fp != NULL) {
+	sprintf(cmd, "mdadm -Ds > %s", ARRAY_PATHNAME);
+	fp = fopen(ARRAY_PATHNAME, "r");
+	while (!feof(fp)) {
 		memset(buf, 0, sizeof(buf));
 		fgets(buf, sizeof(buf), fp);
+		if (strstr(buf, "UUID=") == NULL)
+			continue;
+
+		memset(devname, 0, sizeof(devname));
+		memset(uuid, 0, sizeof(uuid));
+		ret = sscanf(buf, "ARRAY %s %*s UUID=%x:%x:%x:%x", devname,
+				&uuid[0], &uuid[1], &uuid[2], &uuid[3]);
+		if (ret != 5)
+			continue;
+
+		if (uuid[0] == dinfo.raid_uuid[0] && uuid[1] == dinfo.raid_uuid[1] &&
+			uuid[2] == dinfo.raid_uuid[2] && uuid[3] == dinfo.raid_uuid[3]) {
+			found = 1;
+			break;
+		}
+	}
+
+	if (found) {
+		memset(&array, 0, sizeof(array));
+		if (get_array_info(devname, &array)) {
+			/* Fixme: only use of raid5 */
+			if (array.raid_disks <= array.active_disks + 1)
+				return 1;
+		}
 	}
 
 	return 0;
@@ -316,11 +378,7 @@ static int check()
 		count = atoi(buf);
 	}
 
-	if (count > 1) {
-		printf("more than one is running\n");
-		return -1;
-	} else
-		return 0;
+	return count;
 }
 
 static int print_status()
@@ -333,7 +391,7 @@ static int print_status()
 	double avg_spd, remained;
 
 	etc_fd = open_etc_file(0);
-	if (-1 == check() && -2 == etc_fd) {
+	if (check() == 0 && -2 == etc_fd) {
 		printf("%s is not fixing\n", dinfo.name);
 		return 0;
 	} else if (etc_fd > 0) {
@@ -711,8 +769,7 @@ int main(int argc, char **argv)
 
 	switch (option) {
 	case 'f':
-		ret = check(argv[0]);
-		if (ret)
+		if (check(argv[0]) > 1)
 			return 0;
 
 		ret = check_array_status();
