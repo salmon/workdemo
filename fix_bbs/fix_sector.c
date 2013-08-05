@@ -1,6 +1,7 @@
 #include "fix_sector.h"
 #include "md_u.h"
 #include "md_p.h"
+#include <sys/resource.h>
 
 #define PROC_NAME "fix_sector"
 #define BUF_SIZE (1024 * 1024)
@@ -206,12 +207,12 @@ static int get_array_info(const char *array_name, mdu_array_info_t *array)
 	}
 
 /*
-	printf("%d\n", array.raid_disks);
-	printf("%d\n", array.active_disks);
-	printf("%d\n", array.working_disks);
-	printf("%d\n", array.failed_disks);
-	printf("%d\n", array.spare_disks);
-	printf("%x\n", array.state);
+	printf("%d\n", array->raid_disks);
+	printf("%d\n", array->active_disks);
+	printf("%d\n", array->working_disks);
+	printf("%d\n", array->failed_disks);
+	printf("%d\n", array->spare_disks);
+	printf("%x\n", array->state);
 */
 
 	close(fd);
@@ -221,24 +222,29 @@ static int get_array_info(const char *array_name, mdu_array_info_t *array)
 
 static int check_array_status()
 {
-	char cmd[128], buf[512], devname[16];
+	char cmd[128], buf[512], devname[16], *p;
 	int uuid[4], ret, found = 0;
 	FILE *fp;
 	mdu_array_info_t array;
 
-	sprintf(cmd, "mdadm -Ds > %s", ARRAY_PATHNAME);
+	sprintf(cmd, "mdadm -Ds 1>%s 2>/dev/null", ARRAY_PATHNAME);
+	system(cmd);
 	fp = fopen(ARRAY_PATHNAME, "r");
 	while (!feof(fp)) {
 		memset(buf, 0, sizeof(buf));
 		fgets(buf, sizeof(buf), fp);
-		if (strstr(buf, "UUID=") == NULL)
+		if ((p = strstr(buf, "UUID=")) == NULL)
 			continue;
 
 		memset(devname, 0, sizeof(devname));
 		memset(uuid, 0, sizeof(uuid));
-		ret = sscanf(buf, "ARRAY %s %*s UUID=%x:%x:%x:%x", devname,
+		ret = sscanf(buf, "ARRAY %s", devname);
+		if (ret != 1)
+			continue;
+
+		ret = sscanf(p, "UUID=%x:%x:%x:%x", 
 				&uuid[0], &uuid[1], &uuid[2], &uuid[3]);
-		if (ret != 5)
+		if (ret != 4)
 			continue;
 
 		if (uuid[0] == dinfo.raid_uuid[0] && uuid[1] == dinfo.raid_uuid[1] &&
@@ -248,9 +254,11 @@ static int check_array_status()
 		}
 	}
 
+	fclose(fp);
+
 	if (found) {
 		memset(&array, 0, sizeof(array));
-		if (get_array_info(devname, &array)) {
+		if (!get_array_info(devname, &array)) {
 			/* Fixme: only use of raid5 */
 			if (array.raid_disks <= array.active_disks + 1)
 				return 1;
@@ -350,6 +358,7 @@ static int write_status(int fd, off64_t offset, int status)
 {
 	struct timeval ctime;
 	char shm_buf[512];
+	int etc_fd;
 
 	gettimeofday(&ctime, NULL);
 
@@ -359,6 +368,15 @@ static int write_status(int fd, off64_t offset, int status)
 				dinfo.stime.tv_sec, dinfo.start_offset, offset);
 
 	write(fd, shm_buf, strlen(shm_buf) + 1);
+
+	if (1 == status) {
+		etc_fd = open_etc_file(1);
+		if (etc_fd < 0)
+			return 1;
+		write(fd, shm_buf, strlen(shm_buf) + 1);
+
+		close(etc_fd);
+	}
 
 	return 0;
 }
@@ -377,6 +395,8 @@ static int check()
 		fgets(buf, sizeof(buf), fp);
 		count = atoi(buf);
 	}
+
+	fclose(fp);
 
 	return count;
 }
@@ -448,7 +468,7 @@ static int print_status()
 		}
 	}
 
-	printf("avg_spd %.2f, finish percent %d%%, remain %lu seconds\n", avg_spd, percent, finish_time);
+	printf("avg_spd %.2f, finish percent %d, remain %lu seconds\n", avg_spd, percent, finish_time);
 
 	close(shm_fd);
 
@@ -528,11 +548,11 @@ static int fix_bad_sector(int fd, off64_t start_offset)
 	off64_t offset;
 	__u64 scaned_size = 0;
 	ssize_t size;
-	int ret, shm_fd, etc_fd, last = 0;
+	int ret, shm_fd, last = 0;
 	struct timeval ctime;
 	time_t last_sec;
 
-	start_offset = (start_offset * 2 / dinfo.data_disks / dinfo.chunk_size) * dinfo.chunk_size;
+	start_offset = (start_offset / dinfo.data_disks / dinfo.chunk_size) * dinfo.chunk_size;
 	start_offset += dinfo.data_offset;
 	dinfo.start_offset = start_offset;
 
@@ -548,8 +568,9 @@ static int fix_bad_sector(int fd, off64_t start_offset)
 
 	write_status(shm_fd, 0, 0);
 
-	syslog(LOG_INFO, "start_offset %"PRId64 " uuid %X:%X:%X:%X role %d\n", start_offset, dinfo.raid_uuid[0],
-			dinfo.raid_uuid[1], dinfo.raid_uuid[2], dinfo.raid_uuid[3], dinfo.role);
+	syslog(LOG_INFO, "%s %s start_offset %"PRId64 " uuid %X:%X:%X:%X role %d\n",
+		dinfo.name, dinfo.serialno, start_offset, dinfo.raid_uuid[0],
+		dinfo.raid_uuid[1], dinfo.raid_uuid[2], dinfo.raid_uuid[3], dinfo.role);
 
 	if (start_offset > dinfo.data_size) {
 		write_status(shm_fd, dinfo.data_size, 1);
@@ -604,12 +625,6 @@ static int fix_bad_sector(int fd, off64_t start_offset)
 	offset = start_offset + scaned_size;
 	write_status(shm_fd, offset, 1);
 
-	etc_fd = open_etc_file(1);
-	if (etc_fd < 0)
-		return 1;
-	write_status(etc_fd, offset, 1);
-
-	close(etc_fd);
 	close(shm_fd);
 	closelog();
 
@@ -620,7 +635,7 @@ static int open_excl(const char *devname)
 {
 	int fd;
 
-	fd = open(devname, O_RDWR | O_DIRECT);
+	fd = open(devname, O_RDWR | O_DIRECT | O_LARGEFILE);
 	if (fd < 0) {
 		perror("open error");
 		exit(1);
@@ -633,7 +648,7 @@ static int open_ro(const char *devname)
 {
 	int fd;
 
-	fd = open(devname, O_RDONLY | O_DIRECT);
+	fd = open(devname, O_RDONLY | O_DIRECT | O_LARGEFILE);
 	if (fd < 0) {
 		perror("open error");
 		exit(1);
@@ -664,7 +679,22 @@ static int stop_fixing()
 
 	kill(kpid, SIGINT);
 
+	fclose(fp);
+
 	return 0;
+}
+
+static void close_stray_fds()
+{
+	struct rlimit rlim;
+	int fd;
+
+	if (getrlimit(RLIMIT_NOFILE, &rlim) < 0) {
+		return;
+	}
+
+	for (fd = 3; fd < rlim.rlim_cur; fd++)
+		close(fd);
 }
 
 static int deamon_init()
@@ -679,6 +709,7 @@ static int deamon_init()
 	default:
 		_exit(EXIT_SUCCESS);
 	}
+
 
 	if (setsid() == -1)
 		return -1;
@@ -731,8 +762,10 @@ int main(int argc, char **argv)
 			if (optind + 1 != argc)
 				usage();
 
+			close_stray_fds();
 			fd = open_excl(optarg);
 			start_offset = atoll(argv[optind]);
+			start_offset *= 1024;
 			tmp = 1;
 			vaild_opt = 1;
 
@@ -769,12 +802,16 @@ int main(int argc, char **argv)
 
 	switch (option) {
 	case 'f':
-		if (check(argv[0]) > 1)
+		if (check(argv[0]) > 1) {
+			printf("more than one is running\n");
 			return 0;
+		}
 
 		ret = check_array_status();
-		if (ret)
+		if (ret) {
+			printf("raid is active\n");
 			return 0;
+		}
 
 		ret = deamon_init();
 		if (ret)
