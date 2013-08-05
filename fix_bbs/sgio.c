@@ -150,8 +150,6 @@ static int do_drive_cmd(int fd, unsigned char *args, unsigned int timeout_secs)
 		return -1;
 
 	desc = sb + 8;
-	if (sb[0] != 0x72 || sb[7] < 14 || desc[0] != 0x09 || desc[1] < 0x0c)
-		return -1;
 
 	tf.is_lba48 = desc[2] & 1;
 	tf.error = desc[3];

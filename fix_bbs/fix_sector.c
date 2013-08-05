@@ -129,7 +129,6 @@ static int get_devinfo(int fd)
 	struct stat stat_buf;
 	__u16 id[256];
 	char *p;
-	int ident = 1;
 
 	memset(&stat_buf, 0, sizeof(stat_buf));
 	if (fstat(fd, &stat_buf) < 0 ) {
@@ -154,10 +153,9 @@ static int get_devinfo(int fd)
 
 	/* get SerialNo, consider as unique */
 	memset(id, 0, sizeof(id));
-	if (get_identify_data(fd, id)) {
-		ident = 0;
+	if (ioctl(fd, HDIO_GET_IDENTITY, id)) {
 		memset(id, 0, sizeof(id));
-		if (ioctl(fd, HDIO_GET_IDENTITY, id))
+		if (get_identify_data(fd, id))
 			return -1;
 	}
 	memset(dinfo.serialno, 0, sizeof(dinfo.serialno));
@@ -169,24 +167,21 @@ static int get_devinfo(int fd)
 		perror("get serial number error");
 	}
 
-	if (ident) {
-		if((id[106] & 0xc000) != 0x4000) {
-			dinfo.phy_sector_size = 512;
-		} else {
-			unsigned int lsize = 256, pfactor = 1;
-			if (id[106] & (1<<13))
-				pfactor = (1 << (id[106] & 0xf));
-			if (id[106] & (1<<12))
-				lsize = (id[118] << 16) | id[117];
-			dinfo.phy_sector_size = 2 * lsize * pfactor;
-			if ((id[209] & 0xc000) == 0x4000) {
-				unsigned int offset = id[209] & 0x1fff;
-				if (0 != offset * 2 * lsize)
-					dinfo.phy_sector_size = 512;
-			}
-		}
-	} else
+	if((id[106] & 0xc000) != 0x4000) {
 		dinfo.phy_sector_size = 512;
+	} else {
+		unsigned int lsize = 256, pfactor = 1;
+		if (id[106] & (1<<13))
+			pfactor = (1 << (id[106] & 0xf));
+		if (id[106] & (1<<12))
+			lsize = (id[118] << 16) | id[117];
+		dinfo.phy_sector_size = 2 * lsize * pfactor;
+		if ((id[209] & 0xc000) == 0x4000) {
+			unsigned int offset = id[209] & 0x1fff;
+			if (0 != offset * 2 * lsize)
+				dinfo.phy_sector_size = 512;
+		}
+	}
 
 	//fprintf(stderr, "phy sector size %d\n", dinfo.phy_sector_size);
 
