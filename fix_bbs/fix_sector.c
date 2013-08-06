@@ -9,7 +9,6 @@
 #define SECTOR_SIZE 512
 #define INTERVAL 2
 #define HD_SERIAL_LEN 21
-#define ETC_PATHNAME "/etc/fix_sector/"
 #define ARRAY_PATHNAME "/dev/shm/fix_array_info"
 
 struct device_info {
@@ -36,9 +35,9 @@ char *buf;
 
 static void usage()
 {
-	printf("Version: v0.2\n");
+	printf("Version: v0.5\n");
 	printf("Usage:\n");
-	printf("\t-f [dev_name] [start_offset]: fix disk bad sector\n");
+	printf("\t-f [dev_name] [start_percent]: fix disk bad sector\n");
 	printf("\t-s [dev_name]: query disk current status\n");
 	printf("\t-x [dev_name]: stop fixing disk\n");
 	exit(1);
@@ -265,51 +264,6 @@ static int check_array_status()
 
 /**********/
 
-static int open_etc_file(int create)
-{
-	char filename[128];
-	int fd, ret;
-
-	if (access(ETC_PATHNAME, F_OK)) {
-		ret = mkdir(ETC_PATHNAME, 0755);
-		if (ret)
-			return -1;
-	}
-
-	sprintf(filename, ETC_PATHNAME"fix_%s_%x_%x_%x_%x_%d", dinfo.serialno, dinfo.raid_uuid[0],
-			dinfo.raid_uuid[1], dinfo.raid_uuid[2], dinfo.raid_uuid[3], dinfo.role);
-
-	if (create) {
-		fd = open(filename, O_RDWR | O_SYNC | O_CREAT | O_TRUNC);
-		if (fd < 0) {
-			perror("create etcfile error");
-			return -1;
-		}
-	} else {
-		fd = open(filename, O_RDONLY);
-		if (fd < 0) {
-			if (errno == ENOENT)
-				return -2;
-			else
-				return -1;
-		}
-	}
-
-	return fd;
-}
-
-static int unlink_etc_file()
-{
-	char filename[128];
-
-	sprintf(filename, ETC_PATHNAME"fix_%s_%x_%x_%x_%x_%d", dinfo.serialno, dinfo.raid_uuid[0],
-			dinfo.raid_uuid[1], dinfo.raid_uuid[2], dinfo.raid_uuid[3], dinfo.role);
-
-	unlink(filename);
-
-	return 0;
-}
-
 static int open_shm_file(int create)
 {
 	char filename[128];
@@ -353,7 +307,6 @@ static int write_status(int fd, off64_t offset, int status)
 {
 	struct timeval ctime;
 	char shm_buf[512];
-	int etc_fd;
 
 	gettimeofday(&ctime, NULL);
 
@@ -363,15 +316,6 @@ static int write_status(int fd, off64_t offset, int status)
 				dinfo.stime.tv_sec, dinfo.start_offset, offset);
 
 	write(fd, shm_buf, strlen(shm_buf) + 1);
-
-	if (1 == status) {
-		etc_fd = open_etc_file(1);
-		if (etc_fd < 0)
-			return 1;
-		write(fd, shm_buf, strlen(shm_buf) + 1);
-
-		close(etc_fd);
-	}
 
 	return 0;
 }
@@ -398,24 +342,16 @@ static int check()
 
 static int print_status()
 {
-	int shm_fd, etc_fd = -1, ret;
+	int shm_fd, ret;
 	char shm_buf[512];
 	time_t start_time, cur_time, finish_time = 3600 * 2;
 	off64_t start_offset, offset;
 	int status, percent = 0;
 	double avg_spd, remained;
 
-	etc_fd = open_etc_file(0);
-	if (check() == 0 && -2 == etc_fd) {
+	if (check() == 0) {
 		printf("%s is not fixing\n", dinfo.name);
 		return 0;
-	} else if (etc_fd > 0) {
-		ret = sscanf(shm_buf, "%d-%lu-%lu-%"PRId64"-%"PRId64"\n", &status, &cur_time,
-			&start_time, &start_offset, &offset);
-		if (status == 1) {
-			printf("fix badsector finished successfull\n");
-			return 0;
-		}
 	}
 
 	shm_fd = open_shm_file(0);
@@ -538,16 +474,16 @@ static int fix_pending_sector(int fd, const __u64 rd_offset, const size_t size)
 	return 0;
 }
 
-static int fix_bad_sector(int fd, off64_t start_offset)
+static int fix_bad_sector(int fd, int start_percent)
 {
-	off64_t offset;
+	off64_t start_offset, offset;
 	__u64 scaned_size = 0;
 	ssize_t size;
 	int ret, shm_fd, last = 0;
 	struct timeval ctime;
 	time_t last_sec;
 
-	start_offset = (start_offset / dinfo.data_disks / dinfo.chunk_size) * dinfo.chunk_size;
+	start_offset = (dinfo.data_size / 100 / dinfo.chunk_size) * dinfo.chunk_size * start_percent;
 	start_offset += dinfo.data_offset;
 	dinfo.start_offset = start_offset;
 
@@ -556,7 +492,6 @@ static int fix_bad_sector(int fd, off64_t start_offset)
 
 	openlog("fix_bad_sector", LOG_CONS | LOG_PID, LOG_USER);
 
-	unlink_etc_file();
 	shm_fd = open_shm_file(1);
 	if (shm_fd < 0)
 		return 1;
@@ -739,7 +674,7 @@ static int deamon_init()
 int main(int argc, char **argv)
 {
 	int fd, ret, vaild_opt = 0;
-	off64_t start_offset = 0;
+	int start_percent = -1;
 	static const char *option_string = "x:f:s:";
 	int option = 0, tmp = 0;
 
@@ -759,8 +694,10 @@ int main(int argc, char **argv)
 
 			close_stray_fds();
 			fd = open_excl(optarg);
-			start_offset = atoll(argv[optind]);
-			start_offset *= 1024;
+			start_percent = atoll(argv[optind]);
+			if (start_percent < 0 || start_percent >= 100) {
+				perror("invalid start_percent");
+			}
 			tmp = 1;
 			vaild_opt = 1;
 
@@ -811,7 +748,7 @@ int main(int argc, char **argv)
 		ret = deamon_init();
 		if (ret)
 			return 0;
-		fix_bad_sector(fd, start_offset);
+		fix_bad_sector(fd, start_percent);
 		break;
 	case 's':
 		print_status();
