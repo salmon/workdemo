@@ -35,7 +35,7 @@ char *buf;
 
 static void usage()
 {
-	printf("Version: v0.5\n");
+	printf("Version: v0.6\n");
 	printf("Usage:\n");
 	printf("\t-f [dev_name] [start_percent]: fix disk bad sector\n");
 	printf("\t-s [dev_name]: query disk current status\n");
@@ -349,11 +349,6 @@ static int print_status()
 	int status, percent = 0;
 	double avg_spd, remained;
 
-	if (check() == 0) {
-		printf("%s is not fixing\n", dinfo.name);
-		return 0;
-	}
-
 	shm_fd = open_shm_file(0);
 	if (shm_fd < 0) {
 		if (shm_fd == -2) {
@@ -383,6 +378,11 @@ static int print_status()
 	} else if (status != 0) {
 		perror("invalid format");
 		return -1;
+	}
+
+	if (check() == 0) {
+		printf("%s is not fixing\n", dinfo.name);
+		return 0;
 	}
 
 	if (offset < start_offset || offset == 0)
