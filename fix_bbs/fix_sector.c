@@ -35,7 +35,7 @@ char *buf;
 
 static void usage()
 {
-	printf("Version: v0.6\n");
+	printf("Version: v0.7\n");
 	printf("Usage:\n");
 	printf("\t-f [dev_name] [start_percent]: fix disk bad sector\n");
 	printf("\t-s [dev_name]: query disk current status\n");
@@ -161,7 +161,7 @@ static int get_devinfo(int fd)
 	memcpy(dinfo.serialno, (char *)&id[10], 20);
 	p = strip(dinfo.serialno);
 	if (strlen(p)) {
-		strncpy(dinfo.serialno, p, 10);
+		strncpy(dinfo.serialno, p, 20);
 	} else {
 		perror("get serial number error");
 	}
