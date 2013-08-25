@@ -32,10 +32,11 @@ struct device_info {
 
 struct device_info dinfo;
 char *buf;
+static unsigned int cur_spd = 0;
 
 static void usage()
 {
-	printf("Version: v0.7\n");
+	printf("Version: v0.8\n");
 	printf("Usage:\n");
 	printf("\t-f [dev_name] [start_percent]: fix disk bad sector\n");
 	printf("\t-s [dev_name]: query disk current status\n");
@@ -312,8 +313,8 @@ static int write_status(int fd, off64_t offset, int status)
 
 	lseek(fd, 0, SEEK_SET);
 	memset(shm_buf, 0, sizeof(shm_buf));
-	sprintf(shm_buf, "%d-%lu-%lu-%"PRId64"-%"PRId64"\n", status, ctime.tv_sec,
-				dinfo.stime.tv_sec, dinfo.start_offset, offset);
+	sprintf(shm_buf, "%d-%lu-%lu-%"PRId64"-%"PRId64"-%u\n", status, ctime.tv_sec,
+				dinfo.stime.tv_sec, dinfo.start_offset, offset, cur_spd);
 
 	write(fd, shm_buf, strlen(shm_buf) + 1);
 
@@ -347,7 +348,8 @@ static int print_status()
 	time_t start_time, cur_time, finish_time = 3600 * 2;
 	off64_t start_offset, offset;
 	int status, percent = 0;
-	double avg_spd, remained;
+	unsigned int avg_spd = 0;
+	double remained;
 
 	shm_fd = open_shm_file(0);
 	if (shm_fd < 0) {
@@ -361,10 +363,10 @@ static int print_status()
 	}
 
 	read(shm_fd, shm_buf, sizeof(shm_buf));
-	ret = sscanf(shm_buf, "%d-%lu-%lu-%"PRId64"-%"PRId64"\n", &status, &cur_time,
-		&start_time, &start_offset, &offset);
+	ret = sscanf(shm_buf, "%d-%lu-%lu-%"PRId64"-%"PRId64"-%u\n", &status,
+		&cur_time, &start_time, &start_offset, &offset, &avg_spd);
 
-	if (ret != 5) {
+	if (ret != 6) {
 		perror("invalid format");
 		return -1;
 	}
@@ -385,10 +387,7 @@ static int print_status()
 		return 0;
 	}
 
-	if (offset < start_offset || offset == 0)
-		avg_spd = 0;
-	else {
-		avg_spd = (double)(offset - start_offset) / (cur_time - start_time);
+	if (offset >= start_offset && offset != 0 && avg_spd > 0) {
 		if (dinfo.data_size < offset) {
 			finish_time = 0;
 			percent = 100;
@@ -399,7 +398,7 @@ static int print_status()
 		}
 	}
 
-	printf("avg_spd %.2f, finish percent %d, remain %lu seconds\n", avg_spd, percent, finish_time);
+	printf("avg_spd %u, finish percent %d, remain %lu seconds\n", avg_spd, percent, finish_time);
 
 	close(shm_fd);
 
@@ -476,7 +475,7 @@ static int fix_pending_sector(int fd, const __u64 rd_offset, const size_t size)
 
 static int fix_bad_sector(int fd, int start_percent)
 {
-	off64_t start_offset, offset;
+	off64_t start_offset, offset, rec_offset;
 	__u64 scaned_size = 0;
 	ssize_t size;
 	int ret, shm_fd, last = 0;
@@ -506,6 +505,8 @@ static int fix_bad_sector(int fd, int start_percent)
 		write_status(shm_fd, dinfo.data_size, 1);
 		return 0;
 	}
+
+	rec_offset = start_offset;
 
 	while (1) {
 		offset = start_offset + scaned_size;
@@ -547,6 +548,8 @@ static int fix_bad_sector(int fd, int start_percent)
 
 		gettimeofday(&ctime, NULL);
 		if (ctime.tv_sec > last_sec + INTERVAL) {
+			cur_spd = (offset - rec_offset) / (ctime.tv_sec - last_sec);
+			rec_offset = offset;
 			last_sec = ctime.tv_sec;
 			write_status(shm_fd, offset, 0);
 		}
