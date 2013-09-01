@@ -1,15 +1,22 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
 typedef char u8;
 typedef int s32;
 typedef unsigned int u32;
+
+#if __WORDSIZE == 64
+typedef long s64;
+typedef unsigned long u64;
+#else
 typedef long long s64;
 typedef unsigned long long u64;
+#endif
 
 #ifndef __BAD_BLOCKS_H_
 #define __BAD_BLOCKS_H_
 
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -24,6 +31,8 @@ typedef unsigned long long u64;
 #define MD_MAJOR 9
 #define GET_ARRAY_INFO _IOR (MD_MAJOR, 0x11, mdu_array_info_t)
 #define ROUND_UP(x,y) (((x)+(y)-1)/(y))
+#define SECTOR_SIZE 512
+#define PAGE_SIZE 4096
 
 typedef struct mdu_array_info_s {
 	/*
@@ -67,8 +76,8 @@ enum {
 
 struct devinfo {
 	s32 rw;
-	s64 start;
-	s64 end;
+	s64 start_sect;
+	s64 end_sect;
 
 	s32 type;
 	s32 major;
@@ -78,7 +87,7 @@ struct devinfo {
 struct md_devinfo {
 	u8 name[128];
 	s32 max_degraded;
-	s32 stripe_len;
+	s32 stripe_sect;
 	mdu_array_info_t array_info;
 
 	/* in stripe */
