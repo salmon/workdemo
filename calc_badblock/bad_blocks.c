@@ -75,7 +75,7 @@ static s32 get_sys_data_offset(const u8 *pathname, s64 *data_offset)
 		return -1;
 	}
 
-	if (sscanf(buf, "%lu", data_offset) != 1) {
+	if (sscanf(buf, "%"PRId64"", data_offset) != 1) {
 		close(fd);
 		return -1;
 	}
@@ -108,12 +108,15 @@ static s32 sys_fetch_bb(struct md_devinfo *md_info, u32 *bitmap, s32 idx)
 		tmp1 = md_end_bit / (chunk_sector / 8);
 		tmp2 = md_end_bit % (chunk_sector / 8);
 		if (tmp1 > 1 || tmp2 >= md_start_bit) {
-			cross = 1;
-			md_start_bit = tmp % (chunk_sector / 8);
-			md_end_bit = md_start_bit;
-		} else {
 			md_start_bit = 0;
 			md_end_bit = chunk_sector / 8;
+		} else {
+			cross = 1;
+			md_start_bit = md_end_bit % (chunk_sector / 8);
+			if (md_start_bit == 0)
+				md_end_bit = chunk_sector / 8;
+			else
+				md_end_bit = md_start_bit - 1;
 		}
 	}
 
@@ -168,7 +171,10 @@ static s32 sys_fetch_bb(struct md_devinfo *md_info, u32 *bitmap, s32 idx)
 				else
 					end_bit = ROUND_UP(offset + bad_len, 8);
 
-				if (md_start_bit > end_bit || md_end_bit < start_bit)
+				if (cross) {
+					if (md_start_bit >= end_bit && md_end_bit <= start_bit)
+						continue;
+				} else if (md_start_bit > end_bit || md_end_bit < start_bit)
 					continue;
 
 				fprintf(stderr, "start_bit %d, end_bit %d\n", start_bit, end_bit);

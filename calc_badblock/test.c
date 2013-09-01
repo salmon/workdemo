@@ -2,7 +2,7 @@
 
 int main(int args, char **argv)
 {
-	int len = 0, ret;
+	int ret;
 
 	if (args != 2) {
 		printf("wrong arguments\n");
