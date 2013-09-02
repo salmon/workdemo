@@ -1,6 +1,3 @@
-/*
- *
- * */
 #include "bad_blocks.h"
 
 #ifdef _LINUX_
@@ -25,7 +22,7 @@ static void set_bit_range(u32 *bitmap, s32 start_bit, s32 end_bit)
 static s32 get_name_by_devno(struct devinfo *dinfo, char *name)
 {
 	FILE *fp;
-	u8 buf[128];
+	s8 buf[128];
 	s32 maj, min, ret;
 	u64 size_kb;
 
@@ -36,7 +33,7 @@ static s32 get_name_by_devno(struct devinfo *dinfo, char *name)
 	while (!feof(fp)) {
 		memset(buf, 0, sizeof(buf));
 		if (fgets(buf, sizeof(buf), fp)) {
-			ret = sscanf(buf, "%4d  %7d %10"PRIu64" %s", &maj, &min, &size_kb, name);
+			ret = sscanf(buf, "%4d %7d %10llu %s", &maj, &min, &size_kb, name);
 			if (ret != 4)
 				continue;
 
@@ -60,10 +57,10 @@ static s32 get_md_status(s32 fd, mdu_array_info_t *info)
 	return 0;
 }
 
-static s32 get_sys_data_offset(const u8 *pathname, s64 *data_offset)
+static s32 get_sys_data_offset(const s8 *pathname, s64 *data_offset)
 {
 	s32 fd, size;
-	u8 buf[128];
+	s8 buf[128];
 
 	fd = open(pathname, O_RDONLY);
 	if (fd < 0)
@@ -75,7 +72,7 @@ static s32 get_sys_data_offset(const u8 *pathname, s64 *data_offset)
 		return -1;
 	}
 
-	if (sscanf(buf, "%"PRId64"", data_offset) != 1) {
+	if (sscanf(buf, "%llu", data_offset) != 1) {
 		close(fd);
 		return -1;
 	}
@@ -86,7 +83,7 @@ static s32 get_sys_data_offset(const u8 *pathname, s64 *data_offset)
 
 static s32 sys_fetch_bb(struct md_devinfo *md_info, u32 *bitmap, s32 idx)
 {
-	u8 buf[256];
+	s8 buf[256];
 	s64 data_offset, bad_blocks, stripe;
 	s32 i, bad_len, chunk_sector, md_start_bit, md_end_bit;
 	s32 cross = 0, tmp1, tmp2;
@@ -139,7 +136,7 @@ static s32 sys_fetch_bb(struct md_devinfo *md_info, u32 *bitmap, s32 idx)
 
 			memset(buf, 0, sizeof(buf));
 			if (fgets(buf, sizeof(buf), fp)) {
-				switch(sscanf(buf, "%"PRId64" %d", &bad_blocks, &bad_len)) {
+				switch(sscanf(buf, "%llu %d", &bad_blocks, &bad_len)) {
 				case 2:
 					if (bad_len <= 0)
 						invalid = 1;
@@ -171,16 +168,18 @@ static s32 sys_fetch_bb(struct md_devinfo *md_info, u32 *bitmap, s32 idx)
 				else
 					end_bit = ROUND_UP(offset + bad_len, 8);
 
+				fprintf(stderr, "disk idx %d, start_bit %d, end_bit %d\n", idx, start_bit, end_bit);
 				if (cross) {
 					if (md_start_bit >= end_bit && md_end_bit <= start_bit)
 						continue;
 				} else if (md_start_bit > end_bit || md_end_bit < start_bit)
 					continue;
 
-				fprintf(stderr, "start_bit %d, end_bit %d\n", start_bit, end_bit);
 				set_bit_range(bitmap, start_bit, end_bit);
 			}
 		}
+
+		fclose(fp);
 	}
 
 	return 0;
@@ -218,7 +217,7 @@ static s32 is_hit_badblock(struct md_devinfo *md_info)
 		}
 		while ((pos = find_next_bit(pos, tmp)) != 0) {
 			for (j = 0; j < raid_disks; j ++) {
-				if (bitmap[j][i] & (1 << pos))
+				if (bitmap[j][i] & (1 << (pos - 1)))
 					bad_cnt ++;
 			}
 
@@ -239,7 +238,6 @@ static s32 process_badblock(struct devinfo *dinfo, struct md_devinfo *md_info)
 	start_offset = dinfo->start_sect;
 	stripe_offset = start_offset % md_info->stripe_sect;
 	len = dinfo->end_sect - dinfo->start_sect;
-	fprintf(stderr, "stripe size %d, stripe offset %d\n", md_info->stripe_sect, stripe_offset);
 
 	while (len > 0) {
 		if (len > md_info->stripe_sect - stripe_offset) {
@@ -266,7 +264,7 @@ static s32 process_md_badblk(struct devinfo *dinfo)
 {
 	s32 fd, ret, degraded, max_degraded;
 	struct md_devinfo md_info;
-	u8 devname[64];
+	s8 devname[64];
 
 	ret = get_name_by_devno(dinfo, md_info.name);
 	if (ret)
@@ -293,6 +291,7 @@ static s32 process_md_badblk(struct devinfo *dinfo)
 		max_degraded = 2;
 		break;
 	/* case 10: */
+	/* case 50: */
 	default:
 		return -1;
 	}
@@ -312,15 +311,12 @@ static s32 process_md_badblk(struct devinfo *dinfo)
 	return ret;
 }
 
-/*
- * May rewrite by ioctl
- * */
 static s32 process_dmlinear_badblk(struct devinfo *dinfo)
 {
 	FILE *fp;
 	char buf[256];
 	s32 maj, min, ret;
-	s64 start, end, offset, dm_start;
+	s64 start, end, size, offset, dm_start;
 	struct devinfo md_device;
 
 	sprintf(buf, "dmsetup table -j %d -m %d", dinfo->major, dinfo->minor);
@@ -336,11 +332,12 @@ static s32 process_dmlinear_badblk(struct devinfo *dinfo)
 			if ((strstr(buf, "linear")) == NULL)
 				continue;
 
-			ret = sscanf(buf, "%"PRId64" %"PRId64" linear %d:%d %"PRId64"",
-				          &start, &end, &maj, &min, &offset);
+			ret = sscanf(buf, "%llu %llu linear %d:%d %llu",
+				          &start, &size, &maj, &min, &offset);
 			if (ret != 5)
 				continue;
 
+			end = start + size;
 			if (dm_start > end || dinfo->end_sect < start)
 				continue;
 
@@ -428,6 +425,19 @@ static s32 init_device_info(struct devinfo *dinfo, int fd)
 	return 0;
 }
 
+/*
+ * is_badblock:
+ * @fd: the filedescriptor which need to judge for is hitted a badblock.
+ * @offset: the offset bytes from the beginning.
+ * @len: the read or write length from offset.
+ * @rw: indicate read or write opertition, 1 for write, 0 for read.
+ *
+ * judge for operations is hitted a raid badblocks.
+ *
+ * Return 0 for is not hit a badblock
+ * 	1 for hitted a badblock
+ * 	-1 in case of invailed disk type  or raid failed or otherwise failures
+ * */
 s32 is_badblock(s32 fd, s64 offset, s32 len, s32 rw)
 {
 	s32 ret;
@@ -435,7 +445,10 @@ s32 is_badblock(s32 fd, s64 offset, s32 len, s32 rw)
 
 	memset(&dinfo, 0, sizeof(struct devinfo));
 	dinfo.rw = rw;
-	dinfo.start_sect = offset / SECTOR_SIZE;
+	if (rw)
+		dinfo.start_sect = offset / SECTOR_SIZE;
+	else
+		dinfo.start_sect = offset / PAGE_SIZE * PAGE_SIZE;
 	dinfo.end_sect = ROUND_UP((offset + len), SECTOR_SIZE);
 
 	if (init_device_info(&dinfo, fd))
