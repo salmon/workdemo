@@ -10,12 +10,7 @@ typedef char s8;
 typedef int s32;
 typedef unsigned int u32;
 
-#if __WORDSIZE == 64
-typedef long s64;
-typedef unsigned long u64;
-#else
 typedef long long s64;
 typedef unsigned long long u64;
-#endif
 
 #endif

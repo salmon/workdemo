@@ -1,6 +1,9 @@
-#include "bad_blocks.h"
-
 #ifdef _LINUX_
+
+#include "badblk_intern.h"
+
+#define MAX(a,b) (((a)>(b))?(a):(b))
+#define MIN(a,b) (((a)<(b))?(a):(b))
 
 static void set_bit_range(u32 *bitmap, s32 start_bit, s32 end_bit)
 {
@@ -86,7 +89,7 @@ static s32 sys_fetch_bb(struct md_devinfo *md_info, u32 *bitmap, s32 idx)
 	s8 buf[256];
 	s64 data_offset, bad_blocks, stripe;
 	s32 i, bad_len, chunk_sector, md_start_bit, md_end_bit;
-	s32 cross = 0, tmp1, tmp2;
+	s32 cross = 0, tmp1, chunk_bits;
 	FILE *fp;
 
 	sprintf(buf, "/sys/block/%s/md/rd%d", md_info->name, idx);
@@ -98,23 +101,33 @@ static s32 sys_fetch_bb(struct md_devinfo *md_info, u32 *bitmap, s32 idx)
 		return 0;
 
 	chunk_sector = md_info->array_info.chunk_size >> 9;
+	chunk_bits = chunk_sector >> 3;
 	stripe = md_info->start_sect / md_info->stripe_sect;
-	md_start_bit = (md_info->start_sect % chunk_sector) / 8;
-	md_end_bit = md_start_bit + ROUND_UP((md_info->end_sect - md_info->start_sect), 8);
-	if (md_end_bit > (chunk_sector / 8)) {
-		tmp1 = md_end_bit / (chunk_sector / 8);
-		tmp2 = md_end_bit % (chunk_sector / 8);
-		if (tmp1 > 1 || tmp2 >= md_start_bit) {
-			md_start_bit = 0;
-			md_end_bit = chunk_sector / 8;
-		} else {
+	md_start_bit = (md_info->start_sect % md_info->stripe_sect) / 8;
+	md_end_bit = ROUND_UP(md_info->end_sect % md_info->stripe_sect, 8);
+
+	tmp1 = ROUND_UP(md_end_bit, chunk_bits) - md_start_bit / chunk_bits;
+	switch (tmp1) {
+	case 1:
+		md_start_bit %= chunk_bits;
+		if ((md_end_bit %= chunk_bits) == 0)
+			md_end_bit = chunk_bits;
+		break;
+	case 2:
+		md_start_bit %= chunk_bits;
+		if ((md_end_bit %= chunk_bits) == 0)
+			md_end_bit = chunk_bits;
+		if (md_end_bit < md_start_bit) {
 			cross = 1;
-			md_start_bit = md_end_bit % (chunk_sector / 8);
-			if (md_start_bit == 0)
-				md_end_bit = chunk_sector / 8;
-			else
-				md_end_bit = md_start_bit - 1;
+			tmp1 = md_end_bit;
+			md_end_bit = md_start_bit;
+			md_start_bit = tmp1;
+			break;
 		}
+	default:
+		md_start_bit = 0;
+		md_end_bit = chunk_bits;
+		break;
 	}
 
 	for (i = 0; i < 2; i ++) {
@@ -161,21 +174,37 @@ static s32 sys_fetch_bb(struct md_devinfo *md_info, u32 *bitmap, s32 idx)
 				if (stripe != failed_stripe)
 					continue;
 
+				/*
+				fprintf(stderr, "md stripe %llu, cross %d, md_start_bit %d md_end_bit %d ",
+				                stripe, cross, md_start_bit, md_end_bit);
+				*/
+
 				offset = (bad_blocks % chunk_sector);
 				start_bit = offset / 8;
 				if (offset + bad_len >= chunk_sector)
-					end_bit = chunk_sector / 8;
+					end_bit = chunk_bits;
 				else
 					end_bit = ROUND_UP(offset + bad_len, 8);
 
-				fprintf(stderr, "disk idx %d, start_bit %d, end_bit %d\n", idx, start_bit, end_bit);
-				if (cross) {
-					if (md_start_bit >= end_bit && md_end_bit <= start_bit)
-						continue;
-				} else if (md_start_bit > end_bit || md_end_bit < start_bit)
-					continue;
+				/*
+				fprintf(stderr, "start_bit %d end_bit %d\n", start_bit, end_bit);
+				*/
 
-				set_bit_range(bitmap, start_bit, end_bit);
+				if (cross) {
+					if (md_start_bit >= start_bit && md_end_bit <= end_bit)
+						continue;
+					if (start_bit < md_start_bit)
+						set_bit_range(bitmap, start_bit,
+						             MIN(md_start_bit, end_bit));
+					if (end_bit > md_end_bit)
+						set_bit_range(bitmap, MAX(start_bit, md_end_bit),
+						             end_bit);
+				} else {
+					if (md_start_bit > end_bit || md_end_bit <= start_bit)
+						continue;
+					set_bit_range(bitmap, MAX(start_bit, md_start_bit),
+					             MIN(end_bit, md_end_bit));
+				}
 			}
 		}
 
@@ -231,30 +260,26 @@ static s32 is_hit_badblock(struct md_devinfo *md_info)
 
 static s32 process_badblock(struct devinfo *dinfo, struct md_devinfo *md_info)
 {
-	s64 start_offset;
-	s32 stripe_offset, len;
-	s32 process, i = 0;
+	s32 i, count;
+	s64 start_sect;
 
-	start_offset = dinfo->start_sect;
-	stripe_offset = start_offset % md_info->stripe_sect;
-	len = dinfo->end_sect - dinfo->start_sect;
+	count = ROUND_UP(dinfo->end_sect, md_info->stripe_sect) -
+		        dinfo->start_sect / md_info->stripe_sect;
+	start_sect = dinfo->start_sect - dinfo->start_sect % md_info->stripe_sect;
 
-	while (len > 0) {
-		if (len > md_info->stripe_sect - stripe_offset) {
-			process = md_info->stripe_sect - stripe_offset;
-			len -= process;
-		} else {
-			process = len;
-			len = 0;
-		}
+	for (i = 0; i < count; i ++) {
+		if (i == 0)
+			md_info->start_sect = dinfo->start_sect;
+		else
+			md_info->start_sect = start_sect + i * md_info->stripe_sect;
 
-		md_info->start_sect = start_offset + stripe_offset + i * md_info->stripe_sect;
-		md_info->end_sect = md_info->start_sect + process;
+		if (i == (count - 1))
+			md_info->end_sect = dinfo->end_sect;
+		else
+			md_info->end_sect = start_sect + (i + 1) * md_info->stripe_sect;
+
 		if (is_hit_badblock(md_info))
 			return 1;
-
-		stripe_offset = 0;
-		i ++;
 	}
 
 	return 0;
@@ -338,20 +363,24 @@ static s32 process_dmlinear_badblk(struct devinfo *dinfo)
 				continue;
 
 			end = start + size;
-			if (dm_start > end || dinfo->end_sect < start)
+			if (dm_start >= end || dinfo->end_sect < start)
 				continue;
 
 			memset(&md_device, 0, sizeof(struct devinfo));
 			md_device.rw = dinfo->rw;
-			md_device.start_sect = dm_start - start + offset;
+			md_device.start_sect = dm_start + offset - start;
 			if (dinfo->end_sect > end) {
 				dm_start = end;
-				md_device.end_sect = dinfo->end_sect - start + offset;
+				md_device.end_sect = offset + size;
 			} else
-				md_device.end_sect = dinfo->end_sect;
+				md_device.end_sect = dinfo->end_sect + offset - start;
 			md_device.type = TYPE_MD;
 			md_device.major = maj;
 			md_device.minor = min;
+			/*
+			fprintf(stderr, "dm start_sector %llu end_sector %llu\n",
+			       md_device.start_sect, md_device.end_sect);
+			*/
 			ret = process_md_badblk(&md_device);
 			if (ret == 1)
 				return ret;
@@ -445,11 +474,15 @@ s32 is_badblock(s32 fd, s64 offset, s32 len, s32 rw)
 
 	memset(&dinfo, 0, sizeof(struct devinfo));
 	dinfo.rw = rw;
-	if (rw)
+	if (!rw)
 		dinfo.start_sect = offset / SECTOR_SIZE;
 	else
-		dinfo.start_sect = offset / PAGE_SIZE * PAGE_SIZE;
+		dinfo.start_sect = offset / PAGE_SIZE * (PAGE_SIZE / SECTOR_SIZE);
 	dinfo.end_sect = ROUND_UP((offset + len), SECTOR_SIZE);
+	/*
+	fprintf(stderr, "start sector %llu, end_sector %llu\n",
+	       dinfo.start_sect, dinfo.end_sect);
+	*/
 
 	if (init_device_info(&dinfo, fd))
 		return -1;
